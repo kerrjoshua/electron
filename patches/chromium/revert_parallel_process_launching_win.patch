@@ -1,0 +1,1449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Keeley Hammond <khammond@slack-corp.com>
+Date: Fri, 6 Sep 2024 22:35:13 +0100
+Subject: Revert "Parallel process launching"
+
+This reverts commit 18905f7828ed5ddb5f0ca2200a9e66e044f9e9b3.
+
+Reason for revert: suspected cause of https://issues.chromium.org/362910001
+
+Bug: 1499551, 362910001
+Change-Id: I0f1a61945b48d4877d044a988f35b58a05076ac5
+Reviewed-on: https://chromium-review.googlesource.com/c/chromium/src/+/5836201
+Reviewed-by: Bo Liu <boliu@chromium.org>
+Commit-Queue: Will Harris <wfh@chromium.org>
+Bot-Commit: Rubber Stamper <rubber-stamper@appspot.gserviceaccount.com>
+Reviewed-by: Caitlin Fischer <caitlinfischer@google.com>
+Cr-Commit-Position: refs/heads/main@{#1350864}
+
+diff --git a/base/win/scoped_process_information.cc b/base/win/scoped_process_information.cc
+index fae28c9d0060540881231355bd30084965892864..5bb75236fd4164edf01c67b3ad9797c833f25ff8 100644
+--- a/base/win/scoped_process_information.cc
++++ b/base/win/scoped_process_information.cc
+@@ -40,12 +40,6 @@ ScopedProcessInformation::ScopedProcessInformation(
+   Set(process_info);
+ }
+ 
+-ScopedProcessInformation::ScopedProcessInformation(ScopedProcessInformation&&) =
+-    default;
+-
+-ScopedProcessInformation& ScopedProcessInformation::operator=(
+-    ScopedProcessInformation&&) = default;
+-
+ ScopedProcessInformation::~ScopedProcessInformation() {
+   Close();
+ }
+diff --git a/base/win/scoped_process_information.h b/base/win/scoped_process_information.h
+index 56501cbe07a78647e186ce07069cf7111d075739..8090aec00183ce269da25182a01a8d812cba4081 100644
+--- a/base/win/scoped_process_information.h
++++ b/base/win/scoped_process_information.h
+@@ -20,9 +20,6 @@ class BASE_EXPORT ScopedProcessInformation {
+   ScopedProcessInformation();
+   explicit ScopedProcessInformation(const PROCESS_INFORMATION& process_info);
+ 
+-  ScopedProcessInformation(ScopedProcessInformation&&);
+-  ScopedProcessInformation& operator=(ScopedProcessInformation&&);
+-
+   ScopedProcessInformation(const ScopedProcessInformation&) = delete;
+   ScopedProcessInformation& operator=(const ScopedProcessInformation&) = delete;
+ 
+diff --git a/content/browser/child_process_launcher.cc b/content/browser/child_process_launcher.cc
+index cc173ad1a344ff28e9bb385780cf455bcdf3a82b..e3add3d00dee28798b3f901c8e687f85f7ee31af 100644
+--- a/content/browser/child_process_launcher.cc
++++ b/content/browser/child_process_launcher.cc
+@@ -16,7 +16,6 @@
+ #include "base/memory/unsafe_shared_memory_region.h"
+ #include "base/process/launch.h"
+ #include "base/time/time.h"
+-#include "base/trace_event/trace_event.h"
+ #include "base/tracing/protos/chrome_track_event.pbzero.h"
+ #include "base/types/expected.h"
+ #include "base/types/optional_util.h"
+@@ -112,7 +111,6 @@ ChildProcessLauncher::ChildProcessLauncher(
+ #endif
+ {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  TRACE_EVENT_NESTABLE_ASYNC_BEGIN0("startup", "ChildProcessLauncher", this);
+ 
+ #if BUILDFLAG(IS_WIN)
+   should_launch_elevated_ = delegate->ShouldLaunchElevated();
+@@ -169,8 +167,6 @@ void ChildProcessLauncher::Notify(ChildProcessLauncherHelper::Process process,
+ #endif
+                                   int error_code) {
+   DCHECK_CURRENTLY_ON(BrowserThread::UI);
+-  TRACE_EVENT_NESTABLE_ASYNC_END0("startup", "ChildProcessLauncher", this);
+-
+   starting_ = false;
+   process_ = std::move(process);
+ 
+diff --git a/content/browser/child_process_launcher_helper.cc b/content/browser/child_process_launcher_helper.cc
+index e01e1e7dbe5a3f35990c59f53b3c7141c3c57080..b455f0c5ccd07a0177fa6647912519c470856fa3 100644
+--- a/content/browser/child_process_launcher_helper.cc
++++ b/content/browser/child_process_launcher_helper.cc
+@@ -339,23 +339,17 @@ void ChildProcessLauncherHelper::LaunchOnLauncherThread() {
+   }
+ 
+   if (is_synchronous_launch) {
+-    // The LastError is set on the launcher thread, but needs to be transferred
+-    // to the Client thread.
+-    PostLaunchOnLauncherThread(std::move(process),
+-#if BUILDFLAG(IS_WIN)
+-                               ::GetLastError(),
+-#endif
+-                               launch_result);
++    PostLaunchOnLauncherThread(std::move(process), launch_result);
+   }
+ }
+ 
+ void ChildProcessLauncherHelper::PostLaunchOnLauncherThread(
+     ChildProcessLauncherHelper::Process process,
+-#if BUILDFLAG(IS_WIN)
+-    DWORD last_error,
+-#endif
+     int launch_result) {
+ #if BUILDFLAG(IS_WIN)
++  // The LastError is set on the launcher thread, but needs to be transferred to
++  // the Client thread.
++  DWORD last_error = ::GetLastError();
+   const bool launch_elevated = delegate_->ShouldLaunchElevated();
+ #else
+   const bool launch_elevated = false;
+diff --git a/content/browser/child_process_launcher_helper.h b/content/browser/child_process_launcher_helper.h
+index 8f503a90aae79923647d76efc9d1bcdfefdeab0e..6577400b96deff66210055c7a1b15dd3741e2c47 100644
+--- a/content/browser/child_process_launcher_helper.h
++++ b/content/browser/child_process_launcher_helper.h
+@@ -186,14 +186,6 @@ class ChildProcessLauncherHelper
+       bool* is_synchronous_launch,
+       int* launch_result);
+ 
+-#if BUILDFLAG(IS_WIN)
+-  // This is the callback target that handles the result from
+-  // StartSandboxedProcess().
+-  void FinishStartSandboxedProcessOnLauncherThread(base::Process process,
+-                                                   DWORD last_error,
+-                                                   int launch_result);
+-#endif
+-
+   // Called right after the process has been launched, whether it was created
+   // successfully or not. If the process launch is asynchronous, the process may
+   // not yet be created. Platform specific.
+@@ -203,9 +195,6 @@ class ChildProcessLauncherHelper
+ 
+   // Called once the process has been created, successfully or not.
+   void PostLaunchOnLauncherThread(ChildProcessLauncherHelper::Process process,
+-#if BUILDFLAG(IS_WIN)
+-                                  DWORD last_error,
+-#endif
+                                   int launch_result);
+ 
+   // Posted by PostLaunchOnLauncherThread onto the client thread.
+diff --git a/content/browser/child_process_launcher_helper_win.cc b/content/browser/child_process_launcher_helper_win.cc
+index ca232f7c4b44792fd5842d38f88a4d3d2fb4ff66..8b1ed51630dc4fe77bd0edadb85f04fb8962cdd8 100644
+--- a/content/browser/child_process_launcher_helper_win.cc
++++ b/content/browser/child_process_launcher_helper_win.cc
+@@ -182,24 +182,11 @@ ChildProcessLauncherHelper::LaunchProcessOnLauncherThread(
+                                                : LAUNCH_RESULT_FAILURE;
+     return process;
+   }
+-  *is_synchronous_launch = false;
+-  *launch_result = StartSandboxedProcess(
+-      delegate_.get(), *command_line(), options,
+-      base::BindOnce(&ChildProcessLauncherHelper::
+-                         FinishStartSandboxedProcessOnLauncherThread,
+-                     this));
+-  return ChildProcessLauncherHelper::Process();
+-}
+-
+-void ChildProcessLauncherHelper::FinishStartSandboxedProcessOnLauncherThread(
+-    base::Process process,
+-    DWORD last_error,
+-    int launch_result) {
+-  DCHECK(CurrentlyOnProcessLauncherTaskRunner());
+-  ChildProcessLauncherHelper::Process process_wrapper;
+-  process_wrapper.process = std::move(process);
+-  PostLaunchOnLauncherThread(std::move(process_wrapper), last_error,
+-                             launch_result);
++  ChildProcessLauncherHelper::Process process;
++  *launch_result =
++      StartSandboxedProcess(delegate_.get(), *command_line(),
++                            options, &process.process);
++  return process;
+ }
+ 
+ void ChildProcessLauncherHelper::AfterLaunchOnLauncherThread(
+diff --git a/content/common/sandbox_init_win.cc b/content/common/sandbox_init_win.cc
+index 9f4f5f7dd7f2704e363f43c31ac930aeaabc2b45..bfeec6ddb98d4127c1dcfe5999894f1cdebdc087 100644
+--- a/content/common/sandbox_init_win.cc
++++ b/content/common/sandbox_init_win.cc
+@@ -24,7 +24,7 @@ sandbox::ResultCode StartSandboxedProcess(
+     SandboxedProcessLauncherDelegate* delegate,
+     const base::CommandLine& target_command_line,
+     const base::LaunchOptions* options,
+-    sandbox::StartSandboxedProcessCallback result_callback) {
++    base::Process* process) {
+   std::string type_str =
+       target_command_line.GetSwitchValueASCII(switches::kProcessType);
+   TRACE_EVENT1("startup", "StartProcessWithAccess", "type", type_str);
+@@ -45,8 +45,7 @@ sandbox::ResultCode StartSandboxedProcess(
+   }
+ 
+   return sandbox::policy::SandboxWin::StartSandboxedProcess(
+-      full_command_line, options, delegate,
+-      std::move(result_callback));
++      full_command_line, options, delegate, process);
+ }
+ 
+ }  // namespace content
+diff --git a/content/public/common/sandbox_init_win.h b/content/public/common/sandbox_init_win.h
+index b772a2a054e9d19025ebd2909acf1b920d389a95..b614fef01ee5cdf81b7112be721b851c454756a2 100644
+--- a/content/public/common/sandbox_init_win.h
++++ b/content/public/common/sandbox_init_win.h
+@@ -6,12 +6,12 @@
+ #define CONTENT_PUBLIC_COMMON_SANDBOX_INIT_WIN_H_
+ 
+ #include "base/process/launch.h"
+-#include "base/process/process.h"
+ #include "content/common/content_export.h"
+ #include "sandbox/win/src/sandbox_types.h"
+ 
+ namespace base {
+ class CommandLine;
++class Process;
+ }  // namespace base
+ 
+ namespace content {
+@@ -30,7 +30,7 @@ CONTENT_EXPORT sandbox::ResultCode StartSandboxedProcess(
+     SandboxedProcessLauncherDelegate* delegate,
+     const base::CommandLine& target_command_line,
+     const base::LaunchOptions* options,
+-    sandbox::StartSandboxedProcessCallback result_callback);
++    base::Process* process);
+ 
+ }  // namespace content
+ 
+diff --git a/sandbox/policy/features.cc b/sandbox/policy/features.cc
+index 0c85120aaad1439f9a6b1b23d0647c081a0b3e81..f4425b079c0d2de2e3ce624387f48b09bd118364 100644
+--- a/sandbox/policy/features.cc
++++ b/sandbox/policy/features.cc
+@@ -124,11 +124,6 @@ BASE_FEATURE(kWinSboxRestrictCoreSharingOnRenderer,
+              "WinSboxRestrictCoreSharingOnRenderer",
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
+-// Enables parallel process launching using the thread pool.
+-BASE_FEATURE(kWinSboxParallelProcessLaunch,
+-             "WinSboxParallelProcessLaunch",
+-             base::FEATURE_DISABLED_BY_DEFAULT);
+-
+ // Creates an AppContainer policy without registering with the Windows firewall
+ // service. See crbug.com/352720904 for details.
+ BASE_FEATURE(kWinSboxACProfileWithoutFirewall,
+@@ -237,9 +232,4 @@ bool IsNetworkSandboxEnabled() {
+ #endif  // BUILDFLAG(IS_MAC) || BUILDFLAG(IS_FUCHSIA)
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
+-bool IsParallelLaunchEnabled() {
+-  return base::FeatureList::IsEnabled(kWinSboxParallelProcessLaunch);
+-}
+-#endif  // BUILDFLAG(IS_WIN)
+ }  // namespace sandbox::policy::features
+diff --git a/sandbox/policy/features.h b/sandbox/policy/features.h
+index 5bad37bb9d555becdf0582fa87fb30b735c70229..e0ccc8061ee551710e05a41ea28f8b1b715815ee 100644
+--- a/sandbox/policy/features.h
++++ b/sandbox/policy/features.h
+@@ -39,7 +39,6 @@ SANDBOX_POLICY_EXPORT BASE_DECLARE_FEATURE(kNetworkServiceCodeIntegrity);
+ SANDBOX_POLICY_EXPORT BASE_DECLARE_FEATURE(kWinSboxNoFakeGdiInit);
+ SANDBOX_POLICY_EXPORT BASE_DECLARE_FEATURE(
+     kWinSboxRestrictCoreSharingOnRenderer);
+-SANDBOX_POLICY_EXPORT BASE_DECLARE_FEATURE(kWinSboxParallelProcessLaunch);
+ SANDBOX_POLICY_EXPORT BASE_DECLARE_FEATURE(kWinSboxACProfileWithoutFirewall);
+ #endif  // BUILDFLAG(IS_WIN)
+ 
+@@ -76,10 +75,6 @@ SANDBOX_POLICY_EXPORT bool IsNetworkSandboxSupported();
+ // calling ContentBrowserClient::ShouldSandboxNetworkService().
+ SANDBOX_POLICY_EXPORT bool IsNetworkSandboxEnabled();
+ 
+-#if BUILDFLAG(IS_WIN)
+-// Returns whether parallel launching is enabled.
+-SANDBOX_POLICY_EXPORT bool IsParallelLaunchEnabled();
+-#endif  // BUILDFLAG(IS_WIN)
+ }  // namespace sandbox::policy::features
+ 
+ #endif  // SANDBOX_POLICY_FEATURES_H_
+diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
+index 082e8ffdec5f375434a36c95686ef4325780fe0c..6e764cccfbb69717331d13af60c681a889ade750 100644
+--- a/sandbox/policy/win/sandbox_win.cc
++++ b/sandbox/policy/win/sandbox_win.cc
+@@ -41,8 +41,8 @@
+ #include "base/strings/utf_string_conversions.h"
+ #include "base/system/sys_info.h"
+ #include "base/task/sequenced_task_runner.h"
+-#include "base/task/thread_pool.h"
+ #include "base/time/time.h"
++#include "base/timer/elapsed_timer.h"
+ #include "base/trace_event/trace_event.h"
+ #include "base/win/iat_patch_function.h"
+ #include "base/win/scoped_handle.h"
+@@ -100,6 +100,59 @@ BASE_FEATURE(kEnableCsrssLockdownFeature,
+              "EnableCsrssLockdown",
+              base::FEATURE_DISABLED_BY_DEFAULT);
+ 
++// Helper to recording timing information during process creation.
++class SandboxLaunchTimer {
++ public:
++  SandboxLaunchTimer() = default;
++  SandboxLaunchTimer(const SandboxLaunchTimer&) = delete;
++  SandboxLaunchTimer& operator=(const SandboxLaunchTimer&) = delete;
++
++  // Call after the policy base object is created.
++  void OnPolicyCreated() { policy_created_ = timer_.Elapsed(); }
++
++  // Call after the delegate has generated policy settings.
++  void OnPolicyGenerated() { policy_generated_ = timer_.Elapsed(); }
++
++  // Call after CreateProcess() has returned a suspended process.
++  void OnProcessSpawned() { process_spawned_ = timer_.Elapsed(); }
++
++  // Call after unsuspending the process.
++  void OnProcessResumed() { process_resumed_ = timer_.Elapsed(); }
++
++  // Call once to record histograms for a successful process launch.
++  void RecordHistograms() {
++    // If these parameters change the histograms should be renamed.
++    // We're interested in the happy fast case so have a low maximum.
++    const auto kLowBound = base::Microseconds(5);
++    const auto kHighBound = base::Microseconds(100000);
++    const int kBuckets = 50;
++
++    base::UmaHistogramCustomMicrosecondsTimes(
++        "Process.Sandbox.StartSandboxedWin.CreatePolicyDuration",
++        policy_created_, kLowBound, kHighBound, kBuckets);
++    base::UmaHistogramCustomMicrosecondsTimes(
++        "Process.Sandbox.StartSandboxedWin.GeneratePolicyDuration",
++        policy_generated_ - policy_created_, kLowBound, kHighBound, kBuckets);
++    base::UmaHistogramCustomMicrosecondsTimes(
++        "Process.Sandbox.StartSandboxedWin.SpawnTargetDuration",
++        process_spawned_ - policy_generated_, kLowBound, kHighBound, kBuckets);
++    base::UmaHistogramCustomMicrosecondsTimes(
++        "Process.Sandbox.StartSandboxedWin.PostSpawnTargetDuration",
++        process_resumed_ - process_spawned_, kLowBound, kHighBound, kBuckets);
++    base::UmaHistogramCustomMicrosecondsTimes(
++        "Process.Sandbox.StartSandboxedWin.TotalDuration", process_resumed_,
++        kLowBound, kHighBound, kBuckets);
++  }
++
++ private:
++  // `timer_` starts when this object is created.
++  const base::ElapsedTimer timer_;
++  base::TimeDelta policy_created_;
++  base::TimeDelta policy_generated_;
++  base::TimeDelta process_spawned_;
++  base::TimeDelta process_resumed_;
++};
++
+ // Adds the policy rules to allow read-only access to the windows system fonts
+ // directory, and any subdirectories. Used by PDF renderers.
+ bool AddWindowsFontsDir(TargetConfig* config) {
+@@ -694,30 +747,6 @@ bool IsUnsandboxedProcess(
+ 
+ }  // namespace
+ 
+-void SandboxLaunchTimer::RecordHistograms() {
+-  // If these parameters change the histograms should be renamed.
+-  // We're interested in the happy fast case so have a low maximum.
+-  const auto kLowBound = base::Microseconds(5);
+-  const auto kHighBound = base::Microseconds(100000);
+-  const int kBuckets = 50;
+-
+-  base::UmaHistogramCustomMicrosecondsTimes(
+-      "Process.Sandbox.StartSandboxedWin.CreatePolicyDuration", policy_created_,
+-      kLowBound, kHighBound, kBuckets);
+-  base::UmaHistogramCustomMicrosecondsTimes(
+-      "Process.Sandbox.StartSandboxedWin.GeneratePolicyDuration",
+-      policy_generated_ - policy_created_, kLowBound, kHighBound, kBuckets);
+-  base::UmaHistogramCustomMicrosecondsTimes(
+-      "Process.Sandbox.StartSandboxedWin.SpawnTargetDuration",
+-      process_spawned_ - policy_generated_, kLowBound, kHighBound, kBuckets);
+-  base::UmaHistogramCustomMicrosecondsTimes(
+-      "Process.Sandbox.StartSandboxedWin.PostSpawnTargetDuration",
+-      process_resumed_ - process_spawned_, kLowBound, kHighBound, kBuckets);
+-  base::UmaHistogramCustomMicrosecondsTimes(
+-      "Process.Sandbox.StartSandboxedWin.TotalDuration", process_resumed_,
+-      kLowBound, kHighBound, kBuckets);
+-}
+-
+ // static
+ ResultCode SandboxWin::SetJobLevel(Sandbox sandbox_type,
+                                    JobLevel job_level,
+@@ -860,56 +889,13 @@ bool SandboxWin::IsAppContainerEnabledForSandbox(
+   return false;
+ }
+ 
+-class BrokerServicesDelegateImpl : public BrokerServicesDelegate {
+- public:
+-  bool ParallelLaunchEnabled() override {
+-    return features::IsParallelLaunchEnabled();
+-  }
+-
+-  void ParallelLaunchPostTaskAndReplyWithResult(
+-      const base::Location& from_here,
+-      base::OnceCallback<CreateTargetResult()> task,
+-      base::OnceCallback<void(CreateTargetResult)> reply) override {
+-    base::ThreadPool::PostTaskAndReplyWithResult(
+-        from_here,
+-        {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
+-         base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
+-        std::move(task), std::move(reply));
+-  }
+-
+-  void BeforeTargetProcessCreateOnCreationThread(
+-      const void* trace_id) override {
+-    int active_threads = ++creation_threads_in_use_;
+-    base::UmaHistogramCounts100("MPArch.ChildProcessLaunchActivelyInParallel",
+-                                active_threads);
+-
+-    TRACE_EVENT_NESTABLE_ASYNC_BEGIN0("startup", "TargetProcess::Create",
+-                                      trace_id);
+-  }
+-
+-  void AfterTargetProcessCreateOnCreationThread(const void* trace_id,
+-                                                DWORD process_id) override {
+-    creation_threads_in_use_--;
+-    TRACE_EVENT_NESTABLE_ASYNC_END1("startup", "TargetProcess::Create",
+-                                    trace_id, "pid", process_id);
+-  }
+-
+- private:
+-  // When parallel launching is enabled, target creation will happen on the
+-  // thread pool. This is atomic to keep track of the number of threads that are
+-  // currently creating processes.
+-  std::atomic<int> creation_threads_in_use_ = 0;
+-};
+-
+ // static
+ bool SandboxWin::InitBrokerServices(BrokerServices* broker_services) {
+   // TODO(abarth): DCHECK(CalledOnValidThread());
+   //               See <http://b/1287166>.
+   DCHECK(broker_services);
+   DCHECK(!g_broker_services);
+-
+-  ResultCode init_result =
+-      broker_services->Init(std::make_unique<BrokerServicesDelegateImpl>());
++  ResultCode init_result = broker_services->Init();
+   g_broker_services = broker_services;
+ 
+ // In non-official builds warn about dangerous uses of DuplicateHandle. This
+@@ -999,18 +985,14 @@ ResultCode SandboxWin::StartSandboxedProcess(
+     const base::CommandLine& cmd_line,
+     const base::LaunchOptions* options,
+     SandboxDelegate* delegate,
+-    StartSandboxedProcessCallback result_callback) {
++    base::Process* process) {
+   SandboxLaunchTimer timer;
+ 
+   // Avoid making a policy if we won't use it.
+   if (IsUnsandboxedProcess(delegate->GetSandboxType(), cmd_line,
+                            *base::CommandLine::ForCurrentProcess())) {
+-    base::Process process;
+-    ResultCode result =
+-        LaunchWithoutSandbox(cmd_line, *options, delegate, &process);
+-    DWORD last_error = GetLastError();
+-    std::move(result_callback).Run(std::move(process), last_error, result);
+-    return SBOX_ALL_OK;
++    return LaunchWithoutSandbox(cmd_line, *options, delegate,
++                                process);
+   }
+ 
+   auto policy = g_broker_services->CreatePolicy(delegate->GetSandboxTag());
+@@ -1022,51 +1004,27 @@ ResultCode SandboxWin::StartSandboxedProcess(
+     return result;
+   timer.OnPolicyGenerated();
+ 
+-  int64_t trace_event_id = timer.GetStartTimeInMicroseconds();
+-  TRACE_EVENT_NESTABLE_ASYNC_BEGIN0(
+-      "startup", "StartProcessWithAccess::LAUNCHPROCESS", trace_event_id);
++  TRACE_EVENT_BEGIN0("startup", "StartProcessWithAccess::LAUNCHPROCESS");
+ 
+-  result = g_broker_services->SpawnTargetAsync(
++  PROCESS_INFORMATION temp_process_info = {};
++  DWORD last_error = ERROR_SUCCESS;
++  result = g_broker_services->SpawnTarget(
+       cmd_line.GetProgram().value().c_str(),
+-      cmd_line.GetCommandLineString().c_str(), std::move(policy),
+-      base::BindOnce(&SandboxWin::FinishStartSandboxedProcess, delegate,
+-                     std::move(timer), std::move(result_callback)));
+-
+-  if (result != SBOX_ALL_OK) {
+-    TRACE_EVENT_NESTABLE_ASYNC_END0(
+-        "startup", "StartProcessWithAccess::LAUNCHPROCESS", trace_event_id);
++      cmd_line.GetCommandLineString().c_str(), std::move(policy), &last_error,
++      &temp_process_info);
++  timer.OnProcessSpawned();
+ 
+-    if (result == SBOX_ERROR_GENERIC) {
+-      DPLOG(ERROR) << "Failed to launch process";
+-    } else {
+-      DLOG(ERROR) << "Failed to launch process. Error: " << result;
+-    }
+-  }
+-  return result;
+-}
++  base::win::ScopedProcessInformation target(temp_process_info);
+ 
+-// static
+-void SandboxWin::FinishStartSandboxedProcess(
+-    SandboxDelegate* delegate,
+-    SandboxLaunchTimer timer,
+-    StartSandboxedProcessCallback result_callback,
+-    base::win::ScopedProcessInformation target,
+-    DWORD last_error,
+-    ResultCode result) {
+-  timer.OnProcessSpawned();
++  TRACE_EVENT_END0("startup", "StartProcessWithAccess::LAUNCHPROCESS");
+ 
+-  int64_t trace_event_id = timer.GetStartTimeInMicroseconds();
+-  TRACE_EVENT_NESTABLE_ASYNC_END0(
+-      "startup", "StartProcessWithAccess::LAUNCHPROCESS", trace_event_id);
+   if (SBOX_ALL_OK != result) {
+     base::UmaHistogramSparse("Process.Sandbox.Launch.Error", last_error);
+-    if (result == SBOX_ERROR_GENERIC) {
++    if (result == SBOX_ERROR_GENERIC)
+       DPLOG(ERROR) << "Failed to launch process";
+-    } else {
++    else
+       DLOG(ERROR) << "Failed to launch process. Error: " << result;
+-    }
+-    std::move(result_callback).Run(base::Process(), last_error, result);
+-    return;
++    return result;
+   }
+ 
+   delegate->PostSpawnTarget(target.process_handle());
+@@ -1078,8 +1036,8 @@ void SandboxWin::FinishStartSandboxedProcess(
+     timer.RecordHistograms();
+   }
+ 
+-  base::Process process(target.TakeProcessHandle());
+-  std::move(result_callback).Run(std::move(process), last_error, result);
++  *process = base::Process(target.TakeProcessHandle());
++  return SBOX_ALL_OK;
+ }
+ 
+ // static
+diff --git a/sandbox/policy/win/sandbox_win.h b/sandbox/policy/win/sandbox_win.h
+index c86744af9de2c366951d659851aaa9cac74b96de..cd3d803f52972c4ae8af6a0411b5be0e0a5bc782 100644
+--- a/sandbox/policy/win/sandbox_win.h
++++ b/sandbox/policy/win/sandbox_win.h
+@@ -7,16 +7,14 @@
+ 
+ #include <stdint.h>
+ 
+-#include <optional>
+ #include <string>
+ #include <string_view>
+ 
++#include <optional>
+ #include "base/functional/bind.h"
+ #include "base/functional/callback_forward.h"
+ #include "base/process/launch.h"
+ #include "base/process/process_handle.h"
+-#include "base/timer/elapsed_timer.h"
+-#include "base/win/scoped_process_information.h"
+ #include "build/build_config.h"
+ #include "sandbox/policy/export.h"
+ #include "sandbox/policy/sandbox_delegate.h"
+@@ -43,43 +41,6 @@ enum class Sandbox;
+ namespace sandbox {
+ namespace policy {
+ 
+-// Helper to recording timing information during process creation.
+-class SANDBOX_POLICY_EXPORT SandboxLaunchTimer final {
+- public:
+-  SandboxLaunchTimer() = default;
+-  SandboxLaunchTimer(const SandboxLaunchTimer&) = delete;
+-  SandboxLaunchTimer(SandboxLaunchTimer&& other) = default;
+-  SandboxLaunchTimer& operator=(const SandboxLaunchTimer&) = delete;
+-
+-  // Call after the policy base object is created.
+-  void OnPolicyCreated() { policy_created_ = timer_.Elapsed(); }
+-
+-  // Call after the delegate has generated policy settings.
+-  void OnPolicyGenerated() { policy_generated_ = timer_.Elapsed(); }
+-
+-  // Call after CreateProcess() has returned a suspended process.
+-  void OnProcessSpawned() { process_spawned_ = timer_.Elapsed(); }
+-
+-  // Call after unsuspending the process.
+-  void OnProcessResumed() { process_resumed_ = timer_.Elapsed(); }
+-
+-  // Returns when this timer was created.
+-  int64_t GetStartTimeInMicroseconds() const {
+-    return timer_.start_time().since_origin().InMicroseconds();
+-  }
+-
+-  // Call once to record histograms for a successful process launch.
+-  void RecordHistograms();
+-
+- private:
+-  // `timer_` starts when this object is created.
+-  base::ElapsedTimer timer_;
+-  base::TimeDelta policy_created_;
+-  base::TimeDelta policy_generated_;
+-  base::TimeDelta process_spawned_;
+-  base::TimeDelta process_resumed_;
+-};
+-
+ class SANDBOX_POLICY_EXPORT SandboxWin {
+  public:
+   // Create a sandboxed process `process` with the specified `cmd_line`.
+@@ -87,14 +48,13 @@ class SANDBOX_POLICY_EXPORT SandboxWin {
+   // `delegate` specifies the sandbox delegate to use when resolving specific
+   // sandbox policy.
+   //
+-  // If SBOX_ALL_OK is returned, then `result_callback` will be called with the
+-  // process creation result. Otherwise, returns one of sandbox::ResultCode for
+-  // any other error.
++  // Returns SBOX_ALL_OK if the process was successfully created.
++  // Otherwise, returns one of sandbox::ResultCode for any other error.
+   static ResultCode StartSandboxedProcess(
+       const base::CommandLine& cmd_line,
+       const base::LaunchOptions* options,
+       SandboxDelegate* delegate,
+-      StartSandboxedProcessCallback result_callback);
++      base::Process* process);
+ 
+   // Generates a sandbox policy into `policy` to match the one that would be
+   // applied during `StartSandboxedProcess` for the identical set of arguments.
+@@ -164,14 +124,6 @@ class SANDBOX_POLICY_EXPORT SandboxWin {
+  private:
+   FRIEND_TEST_ALL_PREFIXES(SandboxWinTest, GetJobMemoryLimit);
+ 
+-  static void FinishStartSandboxedProcess(
+-      SandboxDelegate* delegate,
+-      SandboxLaunchTimer timer,
+-      StartSandboxedProcessCallback result_callback,
+-      base::win::ScopedProcessInformation target,
+-      DWORD last_error,
+-      ResultCode result);
+-
+   static std::optional<size_t> GetJobMemoryLimit(
+       sandbox::mojom::Sandbox sandbox_type);
+ };
+diff --git a/sandbox/win/BUILD.gn b/sandbox/win/BUILD.gn
+index a82eaae867e4afec6c4c2d610a7794257a30e1c1..7f29a0cc2a57d2321100691245f1c0cb0341d9a2 100644
+--- a/sandbox/win/BUILD.gn
++++ b/sandbox/win/BUILD.gn
+@@ -192,7 +192,6 @@ test("sbox_integration_tests") {
+     "src/ipc_leak_test.cc",
+     "src/ipc_ping_test.cc",
+     "src/lpc_policy_test.cc",
+-    "src/parallel_launch_test.cc",
+     "src/policy_target_test.cc",
+     "src/process_delegate_data_test.cc",
+     "src/process_mitigations_deathtest.cc",
+diff --git a/sandbox/win/src/broker_services.cc b/sandbox/win/src/broker_services.cc
+index 7dc849353498df29f78f3b104328f5cf915c9751..927a7c837c4202db6c58721870b714ead88e8f74 100644
+--- a/sandbox/win/src/broker_services.cc
++++ b/sandbox/win/src/broker_services.cc
+@@ -16,6 +16,7 @@
+ #include "base/win/access_token.h"
+ #include "base/win/current_module.h"
+ #include "base/win/scoped_handle.h"
++#include "base/win/scoped_process_information.h"
+ #include "base/win/windows_version.h"
+ #include "build/build_config.h"
+ #include "sandbox/win/src/app_container.h"
+@@ -254,11 +255,8 @@ BrokerServicesBase::BrokerServicesBase() {}
+ 
+ // The broker uses a dedicated worker thread that services the job completion
+ // port to perform policy notifications and associated cleanup tasks.
+-ResultCode BrokerServicesBase::InitInternal(
+-    std::unique_ptr<BrokerServicesDelegate> delegate,
++ResultCode BrokerServicesBase::Init(
+     std::unique_ptr<BrokerServicesTargetTracker> target_tracker) {
+-  broker_services_delegate_ = std::move(delegate);
+-
+   if (job_port_.is_valid() || thread_pool_) {
+     return SBOX_ERROR_UNEXPECTED_CALL;
+   }
+@@ -299,17 +297,14 @@ ResultCode BrokerServicesBase::InitInternal(
+   return SBOX_ALL_OK;
+ }
+ 
+-ResultCode BrokerServicesBase::Init(
+-    std::unique_ptr<BrokerServicesDelegate> delegate) {
+-  return BrokerServicesBase::InitInternal(std::move(delegate), nullptr);
++ResultCode BrokerServicesBase::Init() {
++  return BrokerServicesBase::Init(nullptr);
+ }
+ 
+ // Only called in test code.
+ ResultCode BrokerServicesBase::InitForTesting(
+-    std::unique_ptr<BrokerServicesDelegate> delegate,
+     std::unique_ptr<BrokerServicesTargetTracker> target_tracker) {
+-  return BrokerServicesBase::InitInternal(std::move(delegate),
+-                                          std::move(target_tracker));
++  return BrokerServicesBase::Init(std::move(target_tracker));
+ }
+ 
+ // The destructor should only be called when the Broker process is terminating.
+@@ -364,55 +359,13 @@ std::unique_ptr<TargetPolicy> BrokerServicesBase::CreatePolicy(
+   return policy;
+ }
+ 
++// SpawnTarget does all the interesting sandbox setup and creates the target
++// process inside the sandbox.
+ ResultCode BrokerServicesBase::SpawnTarget(const wchar_t* exe_path,
+                                            const wchar_t* command_line,
+                                            std::unique_ptr<TargetPolicy> policy,
+                                            DWORD* last_error,
+                                            PROCESS_INFORMATION* target_info) {
+-  *last_error = 0;
+-  *target_info = {};
+-  // With parallel launching disabled, it is safe to capture local references
+-  // because SpawnTargetAsyncImpl is guaranteed to run the callback before
+-  // returning.
+-  ResultCode launch_result = SBOX_ERROR_GENERIC;
+-  ResultCode result = SpawnTargetAsyncImpl(
+-      exe_path, command_line, std::move(policy),
+-      base::BindOnce(
+-          [](DWORD* last_error, PROCESS_INFORMATION* target_info,
+-             ResultCode* launch_result,
+-             base::win::ScopedProcessInformation result_target_info,
+-             DWORD result_last_error, ResultCode result_code) -> void {
+-            *target_info = result_target_info.Take();
+-            *last_error = result_last_error;
+-            *launch_result = result_code;
+-          },
+-          last_error, target_info, &launch_result),
+-      /*allow_parallel_launch=*/false);
+-
+-  if (result == SBOX_ALL_OK) {
+-    result = launch_result;
+-  }
+-  return result;
+-}
+-
+-ResultCode BrokerServicesBase::SpawnTargetAsync(
+-    const wchar_t* exe_path,
+-    const wchar_t* command_line,
+-    std::unique_ptr<TargetPolicy> policy,
+-    SpawnTargetCallback result_callback) {
+-  return SpawnTargetAsyncImpl(exe_path, command_line, std::move(policy),
+-                              std::move(result_callback),
+-                              /*allow_parallel_launch=*/true);
+-}
+-
+-// SpawnTarget does all the interesting sandbox setup and creates the target
+-// process inside the sandbox.
+-ResultCode BrokerServicesBase::SpawnTargetAsyncImpl(
+-    const wchar_t* exe_path,
+-    const wchar_t* command_line,
+-    std::unique_ptr<TargetPolicy> policy,
+-    SpawnTargetCallback result_callback,
+-    bool allow_parallel_launch) {
+   if (!exe_path)
+     return SBOX_ERROR_BAD_PARAMS;
+ 
+@@ -511,88 +464,23 @@ ResultCode BrokerServicesBase::SpawnTargetAsyncImpl(
+ 
+   // Create the TargetProcess object and spawn the target suspended. Note that
+   // Brokerservices does not own the target object. It is owned by the Policy.
++  base::win::ScopedProcessInformation process_info;
+   std::unique_ptr<TargetProcess> target = std::make_unique<TargetProcess>(
+       std::move(*initial_token), std::move(*lockdown_token), thread_pool_);
+ 
+-  if (allow_parallel_launch &&
+-      broker_services_delegate_->ParallelLaunchEnabled()) {
+-    TargetProcess* target_ptr = target.get();
+-    broker_services_delegate_->ParallelLaunchPostTaskAndReplyWithResult(
+-        FROM_HERE,
+-        base::BindOnce(&BrokerServicesBase::CreateTarget,
+-                       base::Unretained(this), target_ptr,
+-                       std::wstring(exe_path), std::wstring(command_line),
+-                       std::move(startup_info)),
+-        base::BindOnce(&BrokerServicesBase::FinishSpawnTarget,
+-                       base::Unretained(this), std::move(policy_base),
+-                       std::move(target), std::move(result_callback)));
+-    return SBOX_ALL_OK;
+-  }
+-
+-  CreateTargetResult target_result = CreateTarget(
+-      target.get(), exe_path, command_line, std::move(startup_info));
++  result = target->Create(exe_path, command_line, std::move(startup_info),
++                          &process_info, last_error);
+ 
+-  FinishSpawnTarget(std::move(policy_base), std::move(target),
+-                    std::move(result_callback), std::move(target_result));
+-  return SBOX_ALL_OK;
+-}
+-
+-CreateTargetResult BrokerServicesBase::CreateTarget(
+-    TargetProcess* target,
+-    const std::wstring& exe_path,
+-    const std::wstring& command_line,
+-    std::unique_ptr<StartupInformationHelper> startup_info) {
+-  // A trace ID for the current scope is generated from the address of a local
+-  // variable to ensure uniqueness across threads.
+-  const void* trace_id = &startup_info;
+-  broker_services_delegate_->BeforeTargetProcessCreateOnCreationThread(
+-      trace_id);
+-
+-  CreateTargetResult result;
+-  result.result_code = target->Create(exe_path.c_str(), command_line.c_str(),
+-                                      std::move(startup_info),
+-                                      &result.process_info, &result.last_error);
+-
+-  broker_services_delegate_->AfterTargetProcessCreateOnCreationThread(
+-      trace_id, result.process_info.process_id());
+-
+-  return result;
+-}
+-
+-void BrokerServicesBase::FinishSpawnTarget(
+-    std::unique_ptr<PolicyBase> policy_base,
+-    std::unique_ptr<TargetProcess> target,
+-    SpawnTargetCallback result_callback,
+-    CreateTargetResult target_result) {
+-  ResultCode result = FinishSpawnTargetImpl(
+-      target_result.result_code, std::move(policy_base), std::move(target),
+-      &target_result.process_info, &target_result.last_error);
+   if (result != SBOX_ALL_OK) {
+-    target_result.process_info.Close();
+-  }
+-  std::move(result_callback)
+-      .Run(std::move(target_result.process_info), target_result.last_error,
+-           result);
+-}
+-
+-ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+-    ResultCode initial_result,
+-    std::unique_ptr<PolicyBase> policy_base,
+-    std::unique_ptr<TargetProcess> target,
+-    base::win::ScopedProcessInformation* process_info,
+-    DWORD* last_error) {
+-  if (initial_result != SBOX_ALL_OK) {
+     target->Terminate();
+-    return initial_result;
++    return result;
+   }
+ 
+-  ConfigBase* config_base = static_cast<ConfigBase*>(policy_base->GetConfig());
+-
+   if (config_base->GetJobLevel() <= JobLevel::kLimitedUser) {
+     // Restrict the job from containing any processes. Job restrictions
+     // are only applied at process creation, so the target process is
+     // unaffected.
+-    ResultCode result = policy_base->DropActiveProcessLimit();
++    result = policy_base->DropActiveProcessLimit();
+     if (result != SBOX_ALL_OK) {
+       target->Terminate();
+       return result;
+@@ -601,7 +489,7 @@ ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+ 
+   // Now the policy is the owner of the target. TargetProcess will terminate
+   // the process if it has not completed when it is destroyed.
+-  ResultCode result = policy_base->ApplyToTarget(std::move(target));
++  result = policy_base->ApplyToTarget(std::move(target));
+ 
+   if (result != SBOX_ALL_OK) {
+     *last_error = ::GetLastError();
+@@ -610,7 +498,7 @@ ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+ 
+   HANDLE job_handle = policy_base->GetJobHandle();
+   JobTracker* tracker =
+-      new JobTracker(std::move(policy_base), process_info->process_id());
++      new JobTracker(std::move(policy_base), process_info.process_id());
+ 
+   // Post the tracker to the tracking thread, then associate the job with
+   // the tracker. The worker thread takes ownership of these objects.
+@@ -620,6 +508,7 @@ ResultCode BrokerServicesBase::FinishSpawnTargetImpl(
+   // There is no obvious cleanup here.
+   CHECK(AssociateCompletionPort(job_handle, job_port_.get(), tracker));
+ 
++  *target_info = process_info.Take();
+   return result;
+ }
+ 
+@@ -713,11 +602,6 @@ void BrokerServicesBase::DestroyDesktops() {
+   alt_desktop_.reset();
+ }
+ 
+-void BrokerServicesBase::SetBrokerServicesDelegateForTesting(
+-    std::unique_ptr<BrokerServicesDelegate> delegate) {
+-  broker_services_delegate_ = std::move(delegate);
+-}
+-
+ // static
+ void BrokerServicesBase::FreezeTargetConfigForTesting(TargetConfig* config) {
+   CHECK(!config->IsConfigured());
+diff --git a/sandbox/win/src/broker_services.h b/sandbox/win/src/broker_services.h
+index c885107071fb6e03dfe5e5fe8e380473b57cb25c..49a2e733ca4636f4dea51f6a843eb87d303d60f9 100644
+--- a/sandbox/win/src/broker_services.h
++++ b/sandbox/win/src/broker_services.h
+@@ -17,7 +17,6 @@
+ #include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/win/scoped_handle.h"
+-#include "base/win/scoped_process_information.h"
+ #include "sandbox/win/src/alternate_desktop.h"
+ #include "sandbox/win/src/crosscall_server.h"
+ #include "sandbox/win/src/sandbox.h"
+@@ -46,9 +45,8 @@ class BrokerServicesBase final : public BrokerServices,
+   ~BrokerServicesBase();
+ 
+   // BrokerServices interface.
+-  ResultCode Init(std::unique_ptr<BrokerServicesDelegate> delegate) override;
++  ResultCode Init() override;
+   ResultCode InitForTesting(
+-      std::unique_ptr<BrokerServicesDelegate> delegate,
+       std::unique_ptr<BrokerServicesTargetTracker> target_tracker) override;
+   ResultCode CreateAlternateDesktop(Desktop desktop) override;
+   void DestroyDesktops() override;
+@@ -60,10 +58,6 @@ class BrokerServicesBase final : public BrokerServices,
+                          std::unique_ptr<TargetPolicy> policy,
+                          DWORD* last_error,
+                          PROCESS_INFORMATION* target) override;
+-  ResultCode SpawnTargetAsync(const wchar_t* exe_path,
+-                              const wchar_t* command_line,
+-                              std::unique_ptr<TargetPolicy> policy,
+-                              SpawnTargetCallback result_callback) override;
+   ResultCode GetPolicyDiagnostics(
+       std::unique_ptr<PolicyDiagnosticsReceiver> receiver) override;
+   void SetStartingMitigations(MitigationFlags starting_mitigations) override;
+@@ -71,56 +65,15 @@ class BrokerServicesBase final : public BrokerServices,
+       MitigationFlags additional_flags) override;
+   std::wstring GetDesktopName(Desktop desktop) override;
+ 
+-  void SetBrokerServicesDelegateForTesting(
+-      std::unique_ptr<BrokerServicesDelegate> delegate);
+-
+   static void FreezeTargetConfigForTesting(TargetConfig* config);
+ 
+  private:
+   // Implements Init and InitForTesting.
+-  ResultCode InitInternal(
+-      std::unique_ptr<BrokerServicesDelegate> delegate,
+-      std::unique_ptr<BrokerServicesTargetTracker> target_tracker);
++  ResultCode Init(std::unique_ptr<BrokerServicesTargetTracker> target_tracker);
+ 
+   // Ensures the desktop integrity suits any process we are launching.
+   ResultCode UpdateDesktopIntegrity(Desktop desktop, IntegrityLevel integrity);
+ 
+-  // Creates the target process and returns the new process handle in the
+-  // result. In parallel launch mode, this function runs on the thread pool.
+-  CreateTargetResult CreateTarget(
+-      TargetProcess* target,
+-      const std::wstring& exe_path,
+-      const std::wstring& command_line,
+-      std::unique_ptr<StartupInformationHelper> startup_info);
+-
+-  // Implementation for SpawnTarget and SpawnTargetAsync.
+-  // Parallel launching will be used if `allow_parallel_launch` is true and
+-  // BrokerServicesDelegate::EnableParallelLaunch() returns true.
+-  // When this function returns SBOX_ALL_OK, `result_callback` will be called
+-  // with the target creation result. Otherwise, the returned error code is
+-  // final and `result_callback` will not be called.
+-  ResultCode SpawnTargetAsyncImpl(const wchar_t* exe_path,
+-                                  const wchar_t* command_line,
+-                                  std::unique_ptr<TargetPolicy> policy,
+-                                  SpawnTargetCallback result_callback,
+-                                  bool allow_parallel_launch);
+-
+-  // This function is a wrapper for FinishSpawnTargetImpl and gets called after
+-  // the target process is created. This function is responsible for running
+-  // `result_callback` to return the information about the new process.
+-  void FinishSpawnTarget(std::unique_ptr<PolicyBase> policy_base,
+-                         std::unique_ptr<TargetProcess> target,
+-                         SpawnTargetCallback result_callback,
+-                         CreateTargetResult target_result);
+-
+-  // Finishes setup after the target process is created.
+-  ResultCode FinishSpawnTargetImpl(
+-      ResultCode initial_result,
+-      std::unique_ptr<PolicyBase> policy_base,
+-      std::unique_ptr<TargetProcess> target,
+-      base::win::ScopedProcessInformation* process_info,
+-      DWORD* last_error);
+-
+   // The completion port used by the job objects to communicate events to
+   // the worker thread.
+   base::win::ScopedHandle job_port_;
+@@ -140,9 +93,6 @@ class BrokerServicesBase final : public BrokerServices,
+   // Cache of configs backing policies. Entries are retained until shutdown and
+   // used to prime policies created by CreatePolicy() with the same `tag`.
+   base::flat_map<std::string, std::unique_ptr<TargetConfig>> config_cache_;
+-
+-  // Provides configuration for using parallel or synchronous process launching.
+-  std::unique_ptr<BrokerServicesDelegate> broker_services_delegate_;
+ };
+ 
+ }  // namespace sandbox
+diff --git a/sandbox/win/src/parallel_launch_test.cc b/sandbox/win/src/parallel_launch_test.cc
+deleted file mode 100644
+index ec558455fa6073b76e5c5d4aa269a0c0505ddf01..0000000000000000000000000000000000000000
+--- a/sandbox/win/src/parallel_launch_test.cc
++++ /dev/null
+@@ -1,251 +0,0 @@
+-// Copyright 2024 The Chromium Authors
+-// Use of this source code is governed by a BSD-style license that can be
+-// found in the LICENSE file.
+-
+-#include <windows.h>
+-
+-#include <memory>
+-#include <string>
+-
+-#include "base/process/process_info.h"
+-#include "base/task/lazy_thread_pool_task_runner.h"
+-#include "base/task/single_thread_task_runner.h"
+-#include "base/task/single_thread_task_runner_thread_mode.h"
+-#include "base/task/thread_pool.h"
+-#include "base/test/task_environment.h"
+-#include "base/win/scoped_process_information.h"
+-#include "sandbox/win/src/broker_services.h"
+-#include "sandbox/win/tests/common/controller.h"
+-#include "testing/gtest/include/gtest/gtest.h"
+-
+-namespace sandbox {
+-
+-// BrokerServicesDelegate common implementation.
+-class TestBrokerServicesDelegateBase : public BrokerServicesDelegate {
+- public:
+-  bool ParallelLaunchEnabled() override { return true; }
+-
+-  void ParallelLaunchPostTaskAndReplyWithResult(
+-      const base::Location& from_here,
+-      base::OnceCallback<CreateTargetResult()> task,
+-      base::OnceCallback<void(CreateTargetResult)> reply) override {
+-    base::ThreadPool::PostTaskAndReplyWithResult(
+-        from_here,
+-        {base::MayBlock(), base::TaskPriority::USER_BLOCKING,
+-         base::TaskShutdownBehavior::BLOCK_SHUTDOWN},
+-        std::move(task), std::move(reply));
+-  }
+-
+-  void AfterTargetProcessCreateOnCreationThread(const void* trace_id,
+-                                                DWORD process_id) override {}
+-};
+-
+-class ParallelLaunchTest : public testing::Test {
+- public:
+-  void SetUp() override {
+-    task_environment_ = std::make_unique<base::test::TaskEnvironment>();
+-  }
+-
+-  static void FinishSpawnTargetAsync(CreateTargetResult* spawn_result,
+-                                     base::RunLoop* run_loop,
+-                                     int* launches_remaining_count,
+-                                     base::win::ScopedProcessInformation target,
+-                                     DWORD last_error,
+-                                     ResultCode result) {
+-    spawn_result->process_info = std::move(target);
+-    spawn_result->last_error = last_error;
+-    spawn_result->result_code = result;
+-
+-    if (--*launches_remaining_count == 0) {
+-      run_loop->Quit();
+-    }
+-  }
+-
+- private:
+-  std::unique_ptr<base::test::TaskEnvironment> task_environment_;
+-};
+-
+-class SingleLaunch_TestBrokerServicesDelegate
+-    : public TestBrokerServicesDelegateBase {
+- public:
+-  void BeforeTargetProcessCreateOnCreationThread(
+-      const void* trace_id) override {
+-    creation_thread_id_ = ::GetCurrentThreadId();
+-  }
+-
+-  DWORD creation_thread_id_ = 0;
+-};
+-
+-// Launches a single child with parallel launching enabled. The child process
+-// will be created on the thread pool.
+-TEST_F(ParallelLaunchTest, SingleLaunch) {
+-  BrokerServices* broker = GetBroker();
+-  ASSERT_TRUE(broker);
+-
+-  auto* delegate = new SingleLaunch_TestBrokerServicesDelegate();
+-  static_cast<BrokerServicesBase*>(broker)->SetBrokerServicesDelegateForTesting(
+-      std::unique_ptr<BrokerServicesDelegate>(delegate));
+-
+-  // Get the path to the sandboxed app.
+-  wchar_t prog_name[MAX_PATH];
+-  GetModuleFileNameW(nullptr, prog_name, MAX_PATH);
+-
+-  std::wstring arguments(L"\"");
+-  arguments += prog_name;
+-  arguments += L"\" -child 0 wait";  // Don't care about the "state" argument.
+-
+-  auto policy = broker->CreatePolicy();
+-  EXPECT_EQ(SBOX_ALL_OK, policy->GetConfig()->SetTokenLevel(USER_INTERACTIVE,
+-                                                            USER_LOCKDOWN));
+-
+-  CreateTargetResult spawn_result;
+-  spawn_result.result_code = SBOX_ERROR_GENERIC;
+-
+-  base::RunLoop run_loop;
+-  int launches_remaining_count = 1;
+-  ResultCode result_code = broker->SpawnTargetAsync(
+-      prog_name, arguments.c_str(), std::move(policy),
+-      base::BindOnce(&FinishSpawnTargetAsync, base::Unretained(&spawn_result),
+-                     base::Unretained(&run_loop),
+-                     base::Unretained(&launches_remaining_count)));
+-  EXPECT_EQ(result_code, SBOX_ALL_OK);
+-
+-  run_loop.Run();
+-
+-  // Target creation should happen on a different thread.
+-  EXPECT_NE(delegate->creation_thread_id_, 0u);
+-  EXPECT_NE(delegate->creation_thread_id_, GetCurrentThreadId());
+-
+-  EXPECT_EQ(SBOX_ALL_OK, spawn_result.result_code);
+-
+-  EXPECT_EQ(1u, ::ResumeThread(spawn_result.process_info.thread_handle()));
+-
+-  EXPECT_EQ(
+-      static_cast<DWORD>(WAIT_TIMEOUT),
+-      ::WaitForSingleObject(spawn_result.process_info.process_handle(), 2000));
+-
+-  EXPECT_TRUE(
+-      ::TerminateProcess(spawn_result.process_info.process_handle(), 0));
+-
+-  ::WaitForSingleObject(spawn_result.process_info.process_handle(), INFINITE);
+-}
+-
+-class ParallelLaunch_TestBrokerServicesDelegate
+-    : public TestBrokerServicesDelegateBase {
+- public:
+-  void BeforeTargetProcessCreateOnCreationThread(
+-      const void* trace_id) override {
+-    if (first_launch_) {
+-      first_creation_thread_id_ = ::GetCurrentThreadId();
+-      first_trace_id_ = reinterpret_cast<uintptr_t>(trace_id);
+-      first_launch_ = false;
+-      EXPECT_TRUE(::SetEvent(reached_first_creation_event_));
+-      ::WaitForSingleObject(first_block_event_, INFINITE);
+-    } else {
+-      second_creation_thread_id_ = ::GetCurrentThreadId();
+-      second_trace_id_ = reinterpret_cast<uintptr_t>(trace_id);
+-      EXPECT_TRUE(::SetEvent(first_block_event_));
+-    }
+-  }
+-
+-  bool first_launch_ = true;
+-  HANDLE reached_first_creation_event_;
+-  HANDLE first_block_event_;
+-  DWORD first_creation_thread_id_;
+-  DWORD second_creation_thread_id_;
+-  uintptr_t first_trace_id_;
+-  uintptr_t second_trace_id_;
+-};
+-
+-// This test launches two processes and synchronizes the target creation threads
+-// to run at the same time.
+-TEST_F(ParallelLaunchTest, ParallelLaunch) {
+-  BrokerServices* broker = GetBroker();
+-  ASSERT_TRUE(broker);
+-
+-  auto* delegate = new ParallelLaunch_TestBrokerServicesDelegate();
+-  static_cast<BrokerServicesBase*>(broker)->SetBrokerServicesDelegateForTesting(
+-      std::unique_ptr<BrokerServicesDelegate>(delegate));
+-
+-  // Get the path to the sandboxed app.
+-  wchar_t prog_name[MAX_PATH];
+-  GetModuleFileNameW(nullptr, prog_name, MAX_PATH);
+-
+-  std::wstring arguments(L"\"");
+-  arguments += prog_name;
+-  arguments += L"\" -child 0 wait";  // Don't care about the "state" argument.
+-
+-  base::RunLoop run_loop;
+-  int launches_remaining_count = 2;
+-
+-  // Launch the first process. This will block on the creation thread and wait
+-  // for the second process launch to unblock it.
+-  CreateTargetResult first_spawn_result;
+-  first_spawn_result.result_code = SBOX_ERROR_GENERIC;
+-  delegate->reached_first_creation_event_ =
+-      ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
+-  delegate->first_block_event_ = ::CreateEvent(nullptr, FALSE, FALSE, nullptr);
+-
+-  {
+-    auto policy = broker->CreatePolicy();
+-    EXPECT_EQ(SBOX_ALL_OK, policy->GetConfig()->SetTokenLevel(USER_INTERACTIVE,
+-                                                              USER_LOCKDOWN));
+-
+-    ResultCode result_code = broker->SpawnTargetAsync(
+-        prog_name, arguments.c_str(), std::move(policy),
+-        base::BindOnce(&FinishSpawnTargetAsync,
+-                       base::Unretained(&first_spawn_result),
+-                       base::Unretained(&run_loop),
+-                       base::Unretained(&launches_remaining_count)));
+-    EXPECT_EQ(result_code, SBOX_ALL_OK);
+-  }
+-
+-  ::WaitForSingleObject(delegate->reached_first_creation_event_, INFINITE);
+-
+-  // Launch the second process.
+-  CreateTargetResult second_spawn_result;
+-  second_spawn_result.result_code = SBOX_ERROR_GENERIC;
+-  {
+-    auto policy = broker->CreatePolicy();
+-    EXPECT_EQ(SBOX_ALL_OK, policy->GetConfig()->SetTokenLevel(USER_INTERACTIVE,
+-                                                              USER_LOCKDOWN));
+-
+-    ResultCode result_code = broker->SpawnTargetAsync(
+-        prog_name, arguments.c_str(), std::move(policy),
+-        base::BindOnce(&FinishSpawnTargetAsync,
+-                       base::Unretained(&second_spawn_result),
+-                       base::Unretained(&run_loop),
+-                       base::Unretained(&launches_remaining_count)));
+-    EXPECT_EQ(result_code, SBOX_ALL_OK);
+-  }
+-
+-  run_loop.Run();
+-
+-  // Targets should be created on different threads.
+-  EXPECT_NE(delegate->first_creation_thread_id_,
+-            delegate->second_creation_thread_id_);
+-
+-  EXPECT_NE(delegate->first_trace_id_, delegate->second_trace_id_);
+-
+-  EXPECT_EQ(SBOX_ALL_OK, first_spawn_result.result_code);
+-  EXPECT_EQ(SBOX_ALL_OK, second_spawn_result.result_code);
+-
+-  EXPECT_EQ(1u,
+-            ::ResumeThread(first_spawn_result.process_info.thread_handle()));
+-  EXPECT_EQ(1u,
+-            ::ResumeThread(second_spawn_result.process_info.thread_handle()));
+-
+-  HANDLE handles[2] = {first_spawn_result.process_info.process_handle(),
+-                       second_spawn_result.process_info.process_handle()};
+-  EXPECT_EQ(static_cast<DWORD>(WAIT_TIMEOUT),
+-            ::WaitForMultipleObjects(2, handles, /*bWaitAll=*/TRUE, 2000));
+-
+-  EXPECT_TRUE(
+-      ::TerminateProcess(first_spawn_result.process_info.process_handle(), 0));
+-  EXPECT_TRUE(
+-      ::TerminateProcess(second_spawn_result.process_info.process_handle(), 0));
+-
+-  ::WaitForMultipleObjects(2, handles, /*bWaitAll=*/TRUE, INFINITE);
+-}
+-
+-}  // namespace sandbox
+diff --git a/sandbox/win/src/sandbox.h b/sandbox/win/src/sandbox.h
+index c76136b80e96340101b62d3d4b022bac72a3f28b..5d35fa9a7a63db0482d23ad66ebb7412fefa3ac6 100644
+--- a/sandbox/win/src/sandbox.h
++++ b/sandbox/win/src/sandbox.h
+@@ -20,14 +20,13 @@
+ #define SANDBOX_WIN_SRC_SANDBOX_H_
+ 
+ #include <stddef.h>
+-
+ #include <memory>
++#include <vector>
++
+ #include <optional>
+ #include <string_view>
+-#include <vector>
+ 
+ #include "base/containers/span.h"
+-#include "base/win/scoped_process_information.h"
+ #include "base/win/windows_types.h"
+ #include "sandbox/win/src/sandbox_policy.h"
+ #include "sandbox/win/src/sandbox_types.h"
+@@ -35,7 +34,6 @@
+ // sandbox: Google User-Land Application Sandbox
+ namespace sandbox {
+ 
+-class BrokerServicesDelegate;
+ class BrokerServicesTargetTracker;
+ class PolicyDiagnosticsReceiver;
+ class ProcessState;
+@@ -61,22 +59,15 @@ enum class Desktop;
+ // compatible definitions of the class even when LTO is enabled.
+ class [[clang::lto_visibility_public]] BrokerServices {
+  public:
+-  // The callback used for receiving the SpawnTarget() process launch result.
+-  // The parameters include the new process and thread handle, the Win32 last
+-  // error code, and the sandbox ResultCode.
+-  using SpawnTargetCallback = base::OnceCallback<
+-      void(base::win::ScopedProcessInformation, DWORD, ResultCode)>;
+-
+   // Initializes the broker. Must be called before any other on this class.
+   // returns ALL_OK if successful. All other return values imply failure.
+   // If the return is ERROR_GENERIC, you can call ::GetLastError() to get
+   // more information.
+-  virtual ResultCode Init(std::unique_ptr<BrokerServicesDelegate> delegate) = 0;
++  virtual ResultCode Init() = 0;
+ 
+   // May be called in place of Init in test code to add a tracker that validates
+   // job notifications and signals an event when all tracked processes are done.
+   virtual ResultCode InitForTesting(
+-      std::unique_ptr<BrokerServicesDelegate> delegate,
+       std::unique_ptr<BrokerServicesTargetTracker> target_tracker) = 0;
+ 
+   // Pre-creates an alternate desktop. Must be called before a non-default
+@@ -138,18 +129,6 @@ class [[clang::lto_visibility_public]] BrokerServices {
+                                  DWORD* last_error,
+                                  PROCESS_INFORMATION* target) = 0;
+ 
+-  // Async version of SpawnTarget that supports parallel process launching.
+-  // Target creation happens on the thread pool when parallel launching is
+-  // enabled (controlled by BrokerServicesDelegate). This function is the same
+-  // as SpawnTarget, except the out parameters `last_error`, `target` and final
+-  // ResultCode are passed to `result_callback`.
+-  // Returns ALL_OK if `result_callback` will run with the result. Otherwise,
+-  // the return error is final and `result_callback` will not be run.
+-  virtual ResultCode SpawnTargetAsync(const wchar_t* exe_path,
+-                                      const wchar_t* command_line,
+-                                      std::unique_ptr<TargetPolicy> policy,
+-                                      SpawnTargetCallback result_callback) = 0;
+-
+   // This call creates a snapshot of policies managed by the sandbox and
+   // returns them via a helper class.
+   // Parameters:
+@@ -274,38 +253,6 @@ class [[clang::lto_visibility_public]] BrokerServicesTargetTracker {
+   virtual ~BrokerServicesTargetTracker() {}
+ };
+ 
+-// Used internally by SpawnTarget() to return process launch info from a task.
+-struct [[clang::lto_visibility_public]] CreateTargetResult {
+-  base::win::ScopedProcessInformation process_info;
+-  DWORD last_error;
+-  ResultCode result_code;
+-};
+-
+-// This class configures BrokerServices to use parallel or synchronous process
+-// launching, and provides callbacks for implementing tracing.
+-class [[clang::lto_visibility_public]] BrokerServicesDelegate {
+- public:
+-  // Returns true if parallel launching is enabled, otherwise synchronous
+-  // launching is used.
+-  virtual bool ParallelLaunchEnabled() = 0;
+-  // This method runs `task` on the thread pool, then runs `reply` on the
+-  // calling sequence with the returned CreateTargetResult. This method must be
+-  // implemented if ParallelLaunchEnabled() can return true.
+-  virtual void ParallelLaunchPostTaskAndReplyWithResult(
+-      const base::Location& from_here,
+-      base::OnceCallback<CreateTargetResult()> task,
+-      base::OnceCallback<void(CreateTargetResult)> reply) = 0;
+-  // Called before a target process is created. If parallel launching is
+-  // enabled, this will be called on the thread pool.
+-  virtual void BeforeTargetProcessCreateOnCreationThread(
+-      const void* trace_id) = 0;
+-  // Called after a target process is created. If parallel launching is enabled,
+-  // this will be called on the thread pool.
+-  virtual void AfterTargetProcessCreateOnCreationThread(const void* trace_id,
+-                                                        DWORD process_id) = 0;
+-  virtual ~BrokerServicesDelegate() {}
+-};
+-
+ }  // namespace sandbox
+ 
+ #endif  // SANDBOX_WIN_SRC_SANDBOX_H_
+diff --git a/sandbox/win/src/sandbox_types.h b/sandbox/win/src/sandbox_types.h
+index c76951c853d088a2d0b3e2cbb00289e0e907634c..363a21494174c580b69d3c907ead348ac7adf097 100644
+--- a/sandbox/win/src/sandbox_types.h
++++ b/sandbox/win/src/sandbox_types.h
+@@ -5,7 +5,6 @@
+ #ifndef SANDBOX_WIN_SRC_SANDBOX_TYPES_H_
+ #define SANDBOX_WIN_SRC_SANDBOX_TYPES_H_
+ 
+-#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/process/kill.h"
+ #include "base/process/launch.h"
+@@ -213,13 +212,6 @@ enum InterceptionType {
+   INTERCEPTION_LAST            // Placeholder for last item in the enumeration
+ };
+ 
+-// This callback is used for returning a process launch result from
+-// StartSandboxedProcess() to the child process launcher helper. The parameters
+-// include the new process handle, the Win32 last error code, and the sandbox
+-// ResultCode.
+-using StartSandboxedProcessCallback =
+-    base::OnceCallback<void(base::Process, DWORD, int)>;
+-
+ }  // namespace sandbox
+ 
+ #endif  // SANDBOX_WIN_SRC_SANDBOX_TYPES_H_
+diff --git a/sandbox/win/tests/common/controller.cc b/sandbox/win/tests/common/controller.cc
+index 6673d9c4dc546af208fdea2989144446188f3518..cfb3d669d04a392ab1866475cc279c466f6b81b8 100644
+--- a/sandbox/win/tests/common/controller.cc
++++ b/sandbox/win/tests/common/controller.cc
+@@ -15,7 +15,6 @@
+ 
+ #include "base/check.h"
+ #include "base/dcheck_is_on.h"
+-#include "base/functional/callback.h"
+ #include "base/memory/platform_shared_memory_region.h"
+ #include "base/memory/read_only_shared_memory_region.h"
+ #include "base/process/process.h"
+@@ -134,28 +133,6 @@ std::wstring MakePathToSys(const wchar_t* name, bool is_obj_man_path) {
+              : MakePathToSys32(name, is_obj_man_path);
+ }
+ 
+-// This delegate is required for initializing BrokerServices and configures it
+-// to use synchronous launching.
+-class TestBrokerServicesDelegateImpl : public BrokerServicesDelegate {
+- public:
+-  bool ParallelLaunchEnabled() override { return false; }
+-
+-  void ParallelLaunchPostTaskAndReplyWithResult(
+-      const base::Location& from_here,
+-      base::OnceCallback<CreateTargetResult()> task,
+-      base::OnceCallback<void(CreateTargetResult)> reply) override {
+-    // This function is only used for parallel launching and should not get
+-    // called.
+-    CHECK(false);
+-  }
+-
+-  void BeforeTargetProcessCreateOnCreationThread(
+-      const void* trace_id) override {}
+-
+-  void AfterTargetProcessCreateOnCreationThread(const void* trace_id,
+-                                                DWORD process_id) override {}
+-};
+-
+ BrokerServices* GetBroker() {
+   static BrokerServices* broker = SandboxFactory::GetBrokerServices();
+   static bool is_initialized = false;
+@@ -171,9 +148,7 @@ BrokerServices* GetBroker() {
+     }
+ 
+     auto tracker = std::make_unique<TargetTracker>(g_no_targets_event);
+-    if (SBOX_ALL_OK != broker->InitForTesting(  // IN-TEST
+-                           std::make_unique<TestBrokerServicesDelegateImpl>(),
+-                           std::move(tracker))) {
++    if (SBOX_ALL_OK != broker->InitForTesting(std::move(tracker))) {
+       return nullptr;
+     }
+ 
+diff --git a/tools/metrics/histograms/metadata/others/histograms.xml b/tools/metrics/histograms/metadata/others/histograms.xml
+index 0b04bbdc3dc0408d44fe22bbebeb9f5a89c9e901..253f913015e5aaddf134f51072fa9cb15b02d0ac 100644
+--- a/tools/metrics/histograms/metadata/others/histograms.xml
++++ b/tools/metrics/histograms/metadata/others/histograms.xml
+@@ -6166,17 +6166,6 @@ chromium-metrics-reviews@google.com.
+   </summary>
+ </histogram>
+ 
+-<histogram name="MPArch.ChildProcessLaunchActivelyInParallel" units="threads"
+-    expires_after="2025-09-01">
+-  <owner>ajgo@chromium.org</owner>
+-  <owner>src/sandbox/policy/win/OWNERS</owner>
+-  <summary>
+-    The number of process creation threads that are actively spawning sub
+-    processes. Recorded at the start of each process launch. Only recorded on
+-    Windows and when parallel process launching is enabled.
+-  </summary>
+-</histogram>
+-
+ <histogram name="MPArch.ChildProcessLauncher.{Event}" units="ms"
+     expires_after="2025-01-05">
+   <owner>ajgo@chromium.org</owner>
